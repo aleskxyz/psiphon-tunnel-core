@@ -3232,7 +3232,9 @@ func (controller *Controller) runInproxyProxy() {
 		connectedClients int32,
 		bytesUp int64,
 		bytesDown int64,
-		_ time.Duration) {
+		_ time.Duration,
+		connectedClientsTotal int64,
+		connectingClientsTotal int64) {
 
 		// This emit logic mirrors the logic for NoticeBytesTransferred and
 		// NoticeTotalBytesTransferred in tunnel.operateTunnel.
@@ -3269,12 +3271,29 @@ func (controller *Controller) runInproxyProxy() {
 
 			NoticeInproxyProxyTotalActivity(
 				connectingClients, connectedClients,
-				activityTotalBytesUp, activityTotalBytesDown)
+				activityTotalBytesUp, activityTotalBytesDown,
+				connectedClientsTotal, connectingClientsTotal)
 			lastActivityNotice = time.Now()
 
 			lastActivityConnectingClientsTotal = connectingClients
 			lastActivityConnectedClientsTotal = connectedClients
 		}
+	}
+
+	// Country stats updater
+	countryStatsUpdater := func(stats map[string]inproxy.CountryStatsSnapshot) {
+		// Convert to JSON-serializable format
+		countryData := make(map[string]interface{})
+		for code, stat := range stats {
+			countryData[code] = map[string]interface{}{
+				"country_code":        stat.CountryCode,
+				"bytes_up_total":      stat.BytesUp,
+				"bytes_down_total":    stat.BytesDown,
+				"connections_total":   stat.TotalConnections,
+				"connections_current": stat.CurrentConnections,
+			}
+		}
+		NoticeInproxyProxyCountryStats(countryData)
 	}
 
 	config := &inproxy.ProxyConfig{
@@ -3291,6 +3310,8 @@ func (controller *Controller) runInproxyProxy() {
 		LimitDownstreamBytesPerSecond: controller.config.InproxyLimitDownstreamBytesPerSecond,
 		MustUpgrade:                   controller.config.OnInproxyMustUpgrade,
 		ActivityUpdater:               activityUpdater,
+		GeoIPDatabasePath:             controller.config.InproxyGeoIPDatabasePath,
+		CountryStatsUpdater:           countryStatsUpdater,
 	}
 
 	proxy, err := inproxy.NewProxy(config)
@@ -3305,9 +3326,12 @@ func (controller *Controller) runInproxyProxy() {
 	proxy.Run(controller.runCtx)
 
 	// Emit one last NoticeInproxyProxyTotalActivity with the final byte counts.
+	// Note: connectingClientsTotal is passed as 0 here since we don't track it
+	// separately in the controller; the periodic notices during Run will have
+	// emitted the accurate final count.
 	NoticeInproxyProxyTotalActivity(
 		lastActivityConnectingClients, lastActivityConnectedClients,
-		activityTotalBytesUp, activityTotalBytesDown)
+		activityTotalBytesUp, activityTotalBytesDown, 0, 0)
 
 	NoticeInfo("inproxy proxy: stopped")
 }

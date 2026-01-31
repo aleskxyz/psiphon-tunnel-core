@@ -1171,14 +1171,26 @@ func NoticeInproxyProxyTotalActivity(
 	connectingClients int32,
 	connectedClients int32,
 	totalBytesUp int64,
-	totalBytesDown int64) {
+	totalBytesDown int64,
+	connectedClientsTotal int64,
+	connectingClientsTotal int64) {
 
 	singletonNoticeLogger.outputNotice(
 		"InproxyProxyTotalActivity", noticeIsDiagnostic,
 		"connectingClients", connectingClients,
 		"connectedClients", connectedClients,
 		"totalBytesUp", totalBytesUp,
-		"totalBytesDown", totalBytesDown)
+		"totalBytesDown", totalBytesDown,
+		"connectedClientsTotal", connectedClientsTotal,
+		"connectingClientsTotal", connectingClientsTotal)
+}
+
+// NoticeInproxyProxyCountryStats reports proxy usage statistics by country.
+// This notice provides aggregated statistics grouped by client country code.
+func NoticeInproxyProxyCountryStats(countryStats map[string]interface{}) {
+	singletonNoticeLogger.outputNotice(
+		"InproxyProxyCountryStats", noticeIsNotDiagnostic,
+		"countries", countryStats)
 }
 
 type repetitiveNoticeState struct {

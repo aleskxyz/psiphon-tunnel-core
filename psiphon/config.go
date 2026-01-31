@@ -691,6 +691,11 @@ type Config struct {
 	// showing proxy connection information and bytes transferred.
 	EmitInproxyProxyActivity bool `json:",omitempty"`
 
+	// InproxyGeoIPDatabasePath specifies the path to a MaxMind GeoIP2 database
+	// file for country-level statistics tracking. When not set, country tracking
+	// is disabled.
+	InproxyGeoIPDatabasePath string `json:",omitempty"`
+
 	// ShutdownGoroutineProfileDeadlineSeconds is the number of seconds to
 	// await shutdown in Controller.Run before dumping a goroutine profile to
 	// diagnostics. Specify 0 to disable. When not specified, the default is

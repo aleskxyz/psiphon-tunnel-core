@@ -22,6 +22,7 @@ package inproxy
 import (
 	"context"
 	"io"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +31,7 @@ import (
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/errors"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/prng"
 	"github.com/Psiphon-Labs/psiphon-tunnel-core/psiphon/common/protocol"
+	"github.com/oschwald/geoip2-golang"
 )
 
 const (
@@ -46,12 +48,14 @@ const (
 // Proxy is the in-proxy proxying component, which relays traffic from a
 // client to a Psiphon server.
 type Proxy struct {
-	bytesUp           atomic.Int64
-	bytesDown         atomic.Int64
-	peakBytesUp       atomic.Int64
-	peakBytesDown     atomic.Int64
-	connectingClients int32
-	connectedClients  int32
+	bytesUp                  atomic.Int64
+	bytesDown                atomic.Int64
+	peakBytesUp              atomic.Int64
+	peakBytesDown            atomic.Int64
+	totalConnections         atomic.Int64 // Total successful connections
+	totalConnectionAttempts  atomic.Int64 // Total connection attempts (including failures)
+	connectingClients        int32
+	connectedClients         int32
 
 	config                *ProxyConfig
 	activityUpdateWrapper *activityUpdateWrapper
@@ -65,6 +69,11 @@ type Proxy struct {
 	nextAnnounceMutex        sync.Mutex
 	nextAnnounceBrokerClient *BrokerClient
 	nextAnnounceNotBefore    time.Time
+
+	// Country-level statistics
+	countryStatsMutex sync.RWMutex
+	countryStats      map[string]*CountryStats
+	geoIPReader       *geoip2.Reader
 }
 
 // TODO: add PublicNetworkAddress/ListenNetworkAddress to facilitate manually
@@ -147,6 +156,13 @@ type ProxyConfig struct {
 	// ActivityUpdater specifies an ActivityUpdater for activity associated
 	// with this proxy.
 	ActivityUpdater ActivityUpdater
+
+	// GeoIPDatabasePath specifies the path to MaxMind GeoIP2 database for
+	// country-level statistics. When empty, country tracking is disabled.
+	GeoIPDatabasePath string
+
+	// CountryStatsUpdater is a callback for country-level statistics updates.
+	CountryStatsUpdater CountryStatsUpdater
 }
 
 // ActivityUpdater is a callback that is invoked when clients connect and
@@ -159,7 +175,53 @@ type ActivityUpdater func(
 	connectedClients int32,
 	bytesUp int64,
 	bytesDown int64,
-	bytesDuration time.Duration)
+	bytesDuration time.Duration,
+	connectedClientsTotal int64,
+	connectingClientsTotal int64)
+
+// CountryStatsUpdater is a callback for country-level statistics updates.
+type CountryStatsUpdater func(stats map[string]CountryStatsSnapshot)
+
+// CountryStats tracks statistics for a single country.
+// NOTE: atomic.Int64 fields must be at the top for proper alignment on 32-bit systems.
+type CountryStats struct {
+	BytesUp            atomic.Int64 // Cumulative bytes uploaded
+	BytesDown          atomic.Int64 // Cumulative bytes downloaded
+	TotalConnections   atomic.Int64 // Total connections ever
+	CurrentConnections atomic.Int32 // Currently active connections
+	CountryCode        string
+}
+
+// CountryStatsSnapshot is a point-in-time snapshot of country statistics.
+type CountryStatsSnapshot struct {
+	CountryCode        string `json:"country_code"`
+	BytesUp            int64  `json:"bytes_up_total"`
+	BytesDown          int64  `json:"bytes_down_total"`
+	TotalConnections   int64  `json:"connections_total"`
+	CurrentConnections int32  `json:"connections_current"`
+}
+
+// connectionActivityWrapper tracks activity for a specific connection and country.
+type connectionActivityWrapper struct {
+	p           *Proxy
+	countryCode string
+}
+
+func (w *connectionActivityWrapper) UpdateProgress(bytesRead, bytesWritten int64, _ int64) {
+	// Update global counters
+	w.p.bytesUp.Add(bytesWritten)
+	w.p.bytesDown.Add(bytesRead)
+
+	// Update per-country counters
+	if w.countryCode != "" {
+		w.p.countryStatsMutex.RLock()
+		if stats, exists := w.p.countryStats[w.countryCode]; exists {
+			stats.BytesUp.Add(bytesWritten)
+			stats.BytesDown.Add(bytesRead)
+		}
+		w.p.countryStatsMutex.RUnlock()
+	}
+}
 
 // NewProxy initializes a new Proxy with the specified configuration.
 func NewProxy(config *ProxyConfig) (*Proxy, error) {
@@ -169,10 +231,26 @@ func NewProxy(config *ProxyConfig) (*Proxy, error) {
 	}
 
 	p := &Proxy{
-		config: config,
+		config:       config,
+		countryStats: make(map[string]*CountryStats),
 	}
 
 	p.activityUpdateWrapper = &activityUpdateWrapper{p: p}
+
+	// Initialize GeoIP reader if path provided
+	if config.GeoIPDatabasePath != "" {
+		reader, err := geoip2.Open(config.GeoIPDatabasePath)
+		if err != nil {
+			return nil, errors.Tracef("failed to open GeoIP database: %v", err)
+		}
+		p.geoIPReader = reader
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"path": config.GeoIPDatabasePath,
+			}).Info("GeoIP database loaded for country-level statistics")
+	} else {
+		p.config.Logger.WithTrace().Info("Country-level statistics disabled (no GeoIP database)")
+	}
 
 	return p, nil
 }
@@ -201,6 +279,14 @@ func (w *activityUpdateWrapper) UpdateProgress(bytesRead, bytesWritten int64, _ 
 // MakeWebRTCDialCoordinator callbacks react to network changes and provide
 // instances that are reflect network changes.
 func (p *Proxy) Run(ctx context.Context) {
+
+	// Close GeoIP reader when proxy stops
+	if p.geoIPReader != nil {
+		defer func() {
+			p.geoIPReader.Close()
+			p.config.Logger.WithTrace().Info("GeoIP database closed")
+		}()
+	}
 
 	// Run MaxClient proxying workers. Each worker handles one client at a time.
 
@@ -263,6 +349,7 @@ loop:
 		select {
 		case <-ticker.C:
 			p.activityUpdate(activityUpdatePeriod)
+			p.countryStatsUpdate()
 		case <-ctx.Done():
 			break loop
 		}
@@ -296,6 +383,8 @@ func (p *Proxy) activityUpdate(period time.Duration) {
 	connectedClients := atomic.LoadInt32(&p.connectedClients)
 	bytesUp := p.bytesUp.Swap(0)
 	bytesDown := p.bytesDown.Swap(0)
+	connectedClientsTotal := p.totalConnections.Load()
+	connectingClientsTotal := p.totalConnectionAttempts.Load()
 
 	greaterThanSwapInt64(&p.peakBytesUp, bytesUp)
 	greaterThanSwapInt64(&p.peakBytesDown, bytesDown)
@@ -318,7 +407,9 @@ func (p *Proxy) activityUpdate(period time.Duration) {
 		connectedClients,
 		bytesUp,
 		bytesDown,
-		period)
+		period,
+		connectedClientsTotal,
+		connectingClientsTotal)
 }
 
 func greaterThanSwapInt64(addr *atomic.Int64, new int64) bool {
@@ -331,6 +422,103 @@ func greaterThanSwapInt64(addr *atomic.Int64, new int64) bool {
 		return addr.CompareAndSwap(old, new)
 	}
 	return false
+}
+
+// lookupCountryCode performs a GeoIP lookup and returns the ISO country code.
+func (p *Proxy) lookupCountryCode(ipString string) string {
+	if p.geoIPReader == nil {
+		return "XX"
+	}
+
+	if ipString == "" {
+		return "XX"
+	}
+
+	ip := net.ParseIP(ipString)
+	if ip == nil {
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"ip": ipString,
+			}).Warning("Invalid IP address for GeoIP lookup")
+		return "XX"
+	}
+
+	// Private IPs are not in the GeoIP database
+	if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() {
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"ip": ipString,
+			}).Debug("Skipping GeoIP lookup for private/special IP")
+		return "XX"
+	}
+
+	record, err := p.geoIPReader.Country(ip)
+	if err != nil {
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"ip":    ipString,
+				"error": err.Error(),
+			}).Debug("GeoIP lookup failed")
+		return "XX"
+	}
+
+	code := record.Country.IsoCode
+	if code == "" {
+		// Empty for anycast IPs (e.g., 1.1.1.1, 8.8.8.8)
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"ip": ipString,
+			}).Debug("No country code in GeoIP record (likely anycast)")
+		code = "XX"
+	}
+
+	return code
+}
+
+// getOrCreateCountryStats gets or creates country statistics for a given country code.
+func (p *Proxy) getOrCreateCountryStats(countryCode string) *CountryStats {
+	p.countryStatsMutex.Lock()
+	defer p.countryStatsMutex.Unlock()
+
+	stats, exists := p.countryStats[countryCode]
+	if !exists {
+		stats = &CountryStats{
+			CountryCode: countryCode,
+		}
+		p.countryStats[countryCode] = stats
+		
+		p.config.Logger.WithTraceFields(
+			common.LogFields{
+				"country_code": countryCode,
+			}).Info("New country detected in proxy statistics")
+	}
+
+	return stats
+}
+
+// countryStatsUpdate sends a snapshot of country statistics to the updater callback.
+func (p *Proxy) countryStatsUpdate() {
+	if p.config.CountryStatsUpdater == nil {
+		return
+	}
+
+	p.countryStatsMutex.RLock()
+	snapshot := make(map[string]CountryStatsSnapshot, len(p.countryStats))
+	for code, stats := range p.countryStats {
+		snapshot[code] = CountryStatsSnapshot{
+			CountryCode:        stats.CountryCode,
+			BytesUp:            stats.BytesUp.Load(),
+			BytesDown:          stats.BytesDown.Load(),
+			TotalConnections:   stats.TotalConnections.Load(),
+			CurrentConnections: stats.CurrentConnections.Load(),
+		}
+	}
+	p.countryStatsMutex.RUnlock()
+
+	// Only call updater if we have data
+	if len(snapshot) > 0 {
+		p.config.CountryStatsUpdater(snapshot)
+	}
 }
 
 func (p *Proxy) proxyClients(
@@ -744,6 +932,7 @@ func (p *Proxy) proxyOneClient(
 	// For activity updates, indicate that a client connection is now underway.
 
 	atomic.AddInt32(&p.connectingClients, 1)
+	p.totalConnectionAttempts.Add(1) // Track all connection attempts
 	connected := false
 	defer func() {
 		if !connected {
@@ -839,6 +1028,15 @@ func (p *Proxy) proxyOneClient(
 		return backOff, errors.Trace(err)
 	}
 
+	// Get remote IP and lookup country code for statistics
+	var countryCode string
+	if p.geoIPReader != nil {
+		remoteIP := webRTCConn.GetRemoteIPAddress()
+		if remoteIP != "" {
+			countryCode = p.lookupCountryCode(remoteIP)
+		}
+	}
+
 	// Dial the destination, a Psiphon server. The broker validates that the
 	// dial destination is a Psiphon server.
 
@@ -887,6 +1085,17 @@ func (p *Proxy) proxyOneClient(
 		atomic.AddInt32(&p.connectedClients, -1)
 	}()
 
+	// Increment global total connections counter
+	p.totalConnections.Add(1)
+
+	// Update country stats - connection successfully established
+	if countryCode != "" {
+		countryStats := p.getOrCreateCountryStats(countryCode)
+		countryStats.TotalConnections.Add(1)
+		countryStats.CurrentConnections.Add(1)
+		defer countryStats.CurrentConnections.Add(-1)
+	}
+
 	// Throttle the relay connection.
 	//
 	// Here, each client gets LimitUp/DownstreamBytesPerSecond. Proxy
@@ -919,8 +1128,17 @@ func (p *Proxy) proxyOneClient(
 			webRTCCoordinator.ProxyRelayInactivityTimeout(),
 			proxyRelayInactivityTimeout)
 
+	// Use per-connection activity wrapper for country tracking
+	var activityWrapper common.ActivityUpdater = p.activityUpdateWrapper
+	if countryCode != "" {
+		activityWrapper = &connectionActivityWrapper{
+			p:           p,
+			countryCode: countryCode,
+		}
+	}
+
 	destinationConn, err = common.NewActivityMonitoredConn(
-		destinationConn, inactivityTimeout, false, nil, p.activityUpdateWrapper)
+		destinationConn, inactivityTimeout, false, nil, activityWrapper)
 	if err != nil {
 		return backOff, errors.Trace(err)
 	}

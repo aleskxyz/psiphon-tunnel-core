@@ -112,6 +112,7 @@ type webRTCConn struct {
 	receiveMediaTrackOpenedSignal chan struct{}
 	mediaTrackReliabilityLayer    *reliableConn
 	iceCandidatePairMetrics       common.LogFields
+	remoteIPAddress               string // Stores the remote client IP address
 
 	readMutex               sync.Mutex
 	readBuffer              []byte
@@ -1307,26 +1308,30 @@ func (conn *webRTCConn) recordSelectedICECandidateStats() error {
 		conn.iceCandidatePairMetrics["inproxy_webrtc_local_ice_candidate_port"] =
 			localCandidateStats.Port
 
-		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_type"] =
-			logCandidateType(remoteCandidateStats.CandidateType)
-		remoteIP := net.ParseIP(remoteCandidateStats.IP)
-		isIPv6 = "0"
-		if remoteIP != nil && remoteIP.To4() == nil {
-			isIPv6 = "1"
-		}
-		isPrivate = "0"
-		if remoteIP != nil && remoteIP.IsPrivate() {
-			isPrivate = "1"
-		}
-		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_is_IPv6"] =
-			isIPv6
-		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_is_private_IP"] =
-			isPrivate
-		conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_port"] =
-			remoteCandidateStats.Port
+	conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_type"] =
+		logCandidateType(remoteCandidateStats.CandidateType)
+	remoteIP := net.ParseIP(remoteCandidateStats.IP)
+	
+	// Store the remote IP address
+	conn.remoteIPAddress = remoteCandidateStats.IP
+	
+	isIPv6 = "0"
+	if remoteIP != nil && remoteIP.To4() == nil {
+		isIPv6 = "1"
+	}
+	isPrivate = "0"
+	if remoteIP != nil && remoteIP.IsPrivate() {
+		isPrivate = "1"
+	}
+	conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_is_IPv6"] =
+		isIPv6
+	conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_is_private_IP"] =
+		isPrivate
+	conn.iceCandidatePairMetrics["inproxy_webrtc_remote_ice_candidate_port"] =
+		remoteCandidateStats.Port
 
-		foundNominatedPair = true
-		break
+	foundNominatedPair = true
+	break
 	}
 	if !foundNominatedPair {
 		return errors.TraceNew("missing nominated ICECandidateStatsPair")
@@ -1492,6 +1497,13 @@ func (conn *webRTCConn) SetReadDeadline(t time.Time) error {
 	}
 
 	return readDeadliner.SetReadDeadline(t)
+}
+
+// GetRemoteIPAddress returns the remote client IP address from ICE candidates.
+func (conn *webRTCConn) GetRemoteIPAddress() string {
+	conn.mutex.Lock()
+	defer conn.mutex.Unlock()
+	return conn.remoteIPAddress
 }
 
 func (conn *webRTCConn) SetWriteDeadline(t time.Time) error {
